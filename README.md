@@ -6,11 +6,14 @@ A Dockerized service that tracks and processes Burroughs service call statistics
 
 - Automatically polls for new batches every 5 minutes (configurable)
 - Separates statistics for Recyclers and Smart Safes
-- Tracks batch-level and daily summary statistics
+- Tracks batch-level, hourly, and daily summary statistics
+- Hierarchical aggregation: Batch → Hourly → Daily
+- Package tracking integration (FedEx and UPS APIs)
 - Handles irregular database updates gracefully
 
 ## Documentation
 
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Comprehensive application architecture and data flow documentation
 - **[DATABASE_STRUCTURE.md](DATABASE_STRUCTURE.md)** - Detailed explanation of the source database table structure and how the system interacts with it
 
 ## Setup
@@ -91,6 +94,10 @@ The `config.json` file contains:
 - **Polling settings**: Interval in minutes (default: 5 minutes)
 - **Table names**: Source table and destination tables for Recyclers and Smart Safes
 - **Daily summary settings**: End-of-day time (default: 11:59 PM CST)
+- **Tracking database**: Connection details for tracking information queries
+- **FedEx API**: API credentials for FedEx package tracking
+- **UPS API**: API credentials for UPS package tracking
+- **Aggregation settings**: Configuration for hourly and daily aggregation
 
 See `config.json.example` for the full configuration structure.
 
@@ -107,23 +114,44 @@ python main.py
 
 ```
 burroughs_stat_tracker/
-├── main.py                 # Small entry point - wires everything together
+├── main.py                    # Entry point - starts polling loop
 ├── app/
 │   ├── __init__.py
-│   ├── config.py          # Settings, constants, configuration loading
-│   ├── utils.py           # Helper functions (equipment filtering, timezone, deduplication)
-│   ├── services.py        # Business logic (batch stats, daily summaries)
-│   ├── controllers.py     # Orchestration (batch processing, polling)
-│   └── data/
-│       ├── __init__.py
-│       └── db.py          # Database connections and table creation
-├── config.json            # Configuration file (not in version control)
-├── config.json.example    # Example configuration template
-├── requirements.txt       # Python dependencies
-├── Dockerfile            # Docker image definition
-├── docker-compose.yml    # Docker Compose configuration
-└── DATABASE_STRUCTURE.md # Database documentation
+│   ├── config/               # Configuration management
+│   │   ├── __init__.py
+│   │   └── settings.py      # Loads and validates config.json
+│   ├── controllers/          # Orchestration layer
+│   │   ├── __init__.py
+│   │   └── batch_controller.py
+│   ├── services/             # Business logic
+│   │   ├── __init__.py
+│   │   ├── batch_stats.py    # Batch-level statistics
+│   │   ├── daily_summary.py  # Daily aggregation
+│   │   ├── hourly_aggregator.py # Hourly aggregation
+│   │   ├── tracking.py       # Tracking database integration
+│   │   ├── fedex_tracker.py  # FedEx API integration
+│   │   └── ups_tracker.py    # UPS API integration
+│   ├── data/                 # Data access layer
+│   │   ├── __init__.py
+│   │   └── database.py       # Database connections and schema
+│   ├── utils/                # Utility functions
+│   │   ├── __init__.py
+│   │   ├── data.py           # Data processing utilities
+│   │   ├── equipment.py      # Equipment type detection
+│   │   ├── timezone.py       # Timezone handling
+│   │   └── tracking_parser.py # Tracking number parsing
+│   └── models/               # Data models (reserved for future use)
+│       └── __init__.py
+├── config.json               # Configuration file (not in version control)
+├── config.json.example       # Example configuration template
+├── requirements.txt          # Python dependencies
+├── Dockerfile               # Docker image definition
+├── docker-compose.yml        # Docker Compose configuration
+├── ARCHITECTURE.md           # Application architecture documentation
+└── DATABASE_STRUCTURE.md     # Database documentation
 ```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ## Notes
 

@@ -19,13 +19,43 @@
     "recyclers": {
       "stat_table": "Burroughs_Recyclers_Stat",
       "history_table": "Burroughs_Recyclers_Closed_Call_History",
+      "hourly_table": "Burroughs_Recyclers_Hourly_Stat",
       "daily_table": "Burroughs_Recyclers_Daily_Summary"
     },
     "smart_safes": {
       "stat_table": "Burroughs_Smart_Safes_Stat",
       "history_table": "Burroughs_Smart_Safes_Closed_Call_History",
+      "hourly_table": "Burroughs_Smart_Safes_Hourly_Stat",
       "daily_table": "Burroughs_Smart_Safes_Daily_Summary"
     }
+  },
+  "aggregation": {
+    "hourly": {
+      "enabled": true,
+      "trigger_on_hour_boundary": true,
+      "validation_enabled": true
+    },
+    "daily": {
+      "enabled": true,
+      "aggregate_from": "hourly"
+    }
+  },
+  "tracking_database": {
+    "driver": "ODBC Driver 18 for SQL Server",
+    "server": "your-tracking-database-server",
+    "database": "your-tracking-database-name",
+    "username": "your-tracking-database-user",
+    "password": "your-tracking-database-password",
+    "trust_server_certificate": true
+  },
+  "fedex_api": {
+    "api_key": "your-fedex-api-key",
+    "api_secret": "your-fedex-api-secret",
+    "use_production": true
+  },
+  "ups_api": {
+    "client_id": "your-ups-client-id",
+    "client_secret": "your-ups-client-secret"
   }
 }
 

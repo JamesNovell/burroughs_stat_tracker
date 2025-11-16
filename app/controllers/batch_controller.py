@@ -1,36 +1,23 @@
 """Controller layer - orchestrates batch processing and polling."""
 import time
 import pymssql
+import logging
 from datetime import datetime
 from app.config import (
-    SOURCE_TABLE, RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, RECYCLERS_DAILY_TABLE,
-    SMART_SAFES_STAT_TABLE, SMART_SAFES_HISTORY_TABLE, SMART_SAFES_DAILY_TABLE,
+    SOURCE_TABLE, RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, RECYCLERS_HOURLY_TABLE, RECYCLERS_DAILY_TABLE,
+    SMART_SAFES_STAT_TABLE, SMART_SAFES_HISTORY_TABLE, SMART_SAFES_HOURLY_TABLE, SMART_SAFES_DAILY_TABLE,
     POLL_INTERVAL_MINUTES
 )
-from app.data.db import get_db_connection, create_tables_if_not_exist
+from app.data.database import get_db_connection, create_tables_if_not_exist
 from app.utils import deduplicate_records
-from app.services import process_equipment_type_stats, calculate_daily_summary
+from app.utils.timezone import to_cst
+from app.services import (
+    process_equipment_type_stats, calculate_daily_summary, get_last_processed_timestamp,
+    aggregate_hourly_stats, should_trigger_hourly_aggregation
+)
+from app.services.tracking import TrackingService
 
-
-def get_last_processed_timestamp(cursor):
-    """Get the timestamp of the last processed batch from either stat table."""
-    last_recyclers_query = f"SELECT TOP 1 BatchID, Timestamp FROM {RECYCLERS_STAT_TABLE} ORDER BY Timestamp DESC;"
-    last_smart_safes_query = f"SELECT TOP 1 BatchID, Timestamp FROM {SMART_SAFES_STAT_TABLE} ORDER BY Timestamp DESC;"
-    cursor.execute(last_recyclers_query)
-    last_recyclers = cursor.fetchone()
-    cursor.execute(last_smart_safes_query)
-    last_smart_safes = cursor.fetchone()
-    
-    # Use the most recent timestamp from either table
-    last_processed = None
-    if last_recyclers and last_smart_safes:
-        last_processed = last_recyclers if last_recyclers['Timestamp'] >= last_smart_safes['Timestamp'] else last_smart_safes
-    elif last_recyclers:
-        last_processed = last_recyclers
-    elif last_smart_safes:
-        last_processed = last_smart_safes
-    
-    return last_processed['Timestamp'] if last_processed else None
+logger = logging.getLogger(__name__)
 
 
 def process_batch():
@@ -94,7 +81,7 @@ def process_batch():
                 last_processed = last_smart_safes
 
         # 5. Fetch and process records for the latest batch
-        cols_to_fetch = '"ID", "Service_Call_ID", "Appt. Status", "Appointment", "Open DateTime", "Batch ID", "Pushed At", "Equipment_ID", "Vendor Call Number"'
+        cols_to_fetch = '"ID", "Service_Call_ID", "Appt. Status", "Appointment", "Open DateTime", "Batch ID", "Pushed At", "Equipment_ID", "Vendor Call Number", "DesNote", "PartNote", "parts_tracking"'
         
         cursor.execute(f"SELECT {cols_to_fetch} FROM {SOURCE_TABLE} WHERE \"Pushed At\" = %s;", (latest_pushed_at,))
         latest_records_raw = cursor.fetchall()
@@ -121,30 +108,119 @@ def process_batch():
                 cursor.execute(f"SELECT {cols_to_fetch} FROM {SOURCE_TABLE} WHERE \"Pushed At\" = %s;", (previous_pushed_at,))
                 previous_records_raw = cursor.fetchall()
                 previous_calls = deduplicate_records(previous_records_raw)
+        
+        # 7. Process tracking for all records in the new batch
+        try:
+            tracking_service = TrackingService()
+            print(f"\n=== Processing tracking for {len(latest_calls)} records in batch {latest_batch_id} ===")
+            
+            processed_count = 0
+            error_count = 0
+            
+            for call_id, record in latest_calls.items():
+                vendor_call_number = record.get('Vendor Call Number')
+                
+                if not vendor_call_number:
+                    continue
+                
+                try:
+                    # Query tracking database
+                    tracking_result = tracking_service.query_tracking_info(vendor_call_number)
+                    
+                    if tracking_result:
+                        tracking_number, parts_list = tracking_result
+                        
+                        # Get DesNote, PartNote, and parts_tracking from the record
+                        des_note = record.get('DesNote')
+                        part_note = record.get('PartNote')
+                        parts_tracking = record.get('parts_tracking')
+                        
+                        # Check for match
+                        tracking_match = tracking_service.check_tracking_match(
+                            tracking_number, des_note, part_note, parts_tracking
+                        )
+                        
+                        # Update columns
+                        tracking_service.update_tracking_columns(
+                            cursor, call_id, tracking_number, parts_list, tracking_match
+                        )
+                        
+                        processed_count += 1
+                    else:
+                        # No tracking info found, set to false
+                        tracking_service.update_tracking_columns(
+                            cursor, call_id, '', [], False
+                        )
+                        processed_count += 1
+                        
+                except Exception as e:
+                    error_count += 1
+                    logger.error(f"Error processing tracking for service call {call_id} (vendor call {vendor_call_number}): {str(e)}")
+                    # Continue with next record
+                    continue
+            
+            print(f"Tracking processing complete: {processed_count} processed, {error_count} errors")
+            
+        except Exception as e:
+            logger.error(f"Error initializing tracking service: {str(e)}")
+            print(f"Warning: Tracking processing failed: {str(e)}")
+            # Continue with batch processing even if tracking fails
 
-        # 7. Process stats for Recyclers
+        # 8. Process stats for Recyclers
         if not recyclers_processed:
             process_equipment_type_stats(
                 cursor, latest_calls, previous_calls, latest_pushed_at, latest_batch_id,
                 RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, "Recyclers", True
             )
+            
+            # Check if hourly aggregation should be triggered
+            latest_pushed_at_cst = to_cst(latest_pushed_at)
+            last_processed_timestamp_cst = to_cst(last_processed['Timestamp']) if last_processed else None
+            
+            should_trigger, hour_start_cst, hour_end_cst = should_trigger_hourly_aggregation(
+                latest_pushed_at_cst, last_processed_timestamp_cst
+            )
+            
+            if should_trigger:
+                print(f"\n=== Triggering hourly aggregation for Recyclers ===")
+                aggregate_hourly_stats(
+                    cursor, RECYCLERS_STAT_TABLE, RECYCLERS_HOURLY_TABLE,
+                    hour_start_cst, hour_end_cst, "Recyclers"
+                )
+            
             # Calculate daily summary if it's end of day
             calculate_daily_summary(
                 cursor, latest_pushed_at, latest_calls,
-                RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, RECYCLERS_DAILY_TABLE,
+                RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, RECYCLERS_HOURLY_TABLE, RECYCLERS_DAILY_TABLE,
                 "Recyclers", True
             )
         
-        # 8. Process stats for Smart Safes
+        # 9. Process stats for Smart Safes
         if not smart_safes_processed:
             process_equipment_type_stats(
                 cursor, latest_calls, previous_calls, latest_pushed_at, latest_batch_id,
                 SMART_SAFES_STAT_TABLE, SMART_SAFES_HISTORY_TABLE, "Smart Safes", False
             )
+            
+            # Check if hourly aggregation should be triggered
+            latest_pushed_at_cst = to_cst(latest_pushed_at)
+            last_processed_timestamp_cst = to_cst(last_processed['Timestamp']) if last_processed else None
+            
+            should_trigger, hour_start_cst, hour_end_cst = should_trigger_hourly_aggregation(
+                latest_pushed_at_cst, last_processed_timestamp_cst
+            )
+            
+            if should_trigger:
+                print(f"\n=== Triggering hourly aggregation for Smart Safes ===")
+                aggregate_hourly_stats(
+                    cursor, SMART_SAFES_STAT_TABLE, SMART_SAFES_HOURLY_TABLE,
+                    hour_start_cst, hour_end_cst, "Smart Safes"
+                )
+            
             # Calculate daily summary if it's end of day
             calculate_daily_summary(
                 cursor, latest_pushed_at, latest_calls,
-                SMART_SAFES_STAT_TABLE, SMART_SAFES_HISTORY_TABLE, SMART_SAFES_DAILY_TABLE,
+                SMART_SAFES_STAT_TABLE, SMART_SAFES_HISTORY_TABLE, SMART_SAFES_HOURLY_TABLE, SMART_SAFES_DAILY_TABLE,
                 "Smart Safes", False
             )
         
