@@ -1,16 +1,15 @@
-"""Main entry point for the Burroughs statistics tracker."""
+"""Controller layer - orchestrates batch processing and polling."""
 import time
 import pymssql
 from datetime import datetime
-from config import (
+from app.config import (
     SOURCE_TABLE, RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, RECYCLERS_DAILY_TABLE,
     SMART_SAFES_STAT_TABLE, SMART_SAFES_HISTORY_TABLE, SMART_SAFES_DAILY_TABLE,
     POLL_INTERVAL_MINUTES
 )
-from database import get_db_connection, create_tables_if_not_exist
-from helpers import deduplicate_records
-from batch_stats import process_equipment_type_stats
-from daily_summary import calculate_daily_summary
+from app.data.db import get_db_connection, create_tables_if_not_exist
+from app.utils import deduplicate_records
+from app.services import process_equipment_type_stats, calculate_daily_summary
 
 
 def get_last_processed_timestamp(cursor):
@@ -34,7 +33,7 @@ def get_last_processed_timestamp(cursor):
     return last_processed['Timestamp'] if last_processed else None
 
 
-def get_db_stats():
+def process_batch():
     """Main function to process and track statistics. Returns True if a batch was processed, False otherwise."""
     conn = None
     try:
@@ -182,7 +181,7 @@ def poll_for_batches(poll_interval_minutes=None):
     while True:
         try:
             # Try to process any available batches
-            batch_processed = get_db_stats()
+            batch_processed = process_batch()
             
             if batch_processed:
                 print(f"\n[{datetime.now()}] Batch processed successfully. Waiting {poll_interval_minutes} minutes before next check...")
@@ -201,7 +200,3 @@ def poll_for_batches(poll_interval_minutes=None):
             print(f"Waiting {poll_interval_minutes} minutes before retry...")
             time.sleep(poll_interval_seconds)
 
-
-if __name__ == "__main__":
-    # Run in polling mode by default (uses POLL_INTERVAL_MINUTES from config.json)
-    poll_for_batches()

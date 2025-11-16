@@ -1,0 +1,31 @@
+{
+  "_comment": "SECURITY WARNING: Never commit config.json with real credentials to version control. This file (config.json.example) is a template with placeholder values. Copy this to config.json and fill in your actual credentials. Real credentials should be kept secure and never committed to git history.",
+  "database": {
+    "host": "your-database-host",
+    "user": "your-database-user",
+    "password": "your-database-password",
+    "name": "master"
+  },
+  "polling": {
+    "interval_minutes": 5
+  },
+  "daily_summary": {
+    "eod_hour": 23,
+    "eod_minute": 59,
+    "timezone": "CST"
+  },
+  "tables": {
+    "source_table": "dbo.Burroughs_Open_Calls",
+    "recyclers": {
+      "stat_table": "Burroughs_Recyclers_Stat",
+      "history_table": "Burroughs_Recyclers_Closed_Call_History",
+      "daily_table": "Burroughs_Recyclers_Daily_Summary"
+    },
+    "smart_safes": {
+      "stat_table": "Burroughs_Smart_Safes_Stat",
+      "history_table": "Burroughs_Smart_Safes_Closed_Call_History",
+      "daily_table": "Burroughs_Smart_Safes_Daily_Summary"
+    }
+  }
+}
+
