@@ -20,13 +20,17 @@
       "stat_table": "Burroughs_Recyclers_Stat",
       "history_table": "Burroughs_Recyclers_Closed_Call_History",
       "hourly_table": "Burroughs_Recyclers_Hourly_Stat",
-      "daily_table": "Burroughs_Recyclers_Daily_Summary"
+      "daily_table": "Burroughs_Recyclers_Daily_Summary",
+      "weekly_table": "Burroughs_Recyclers_Weekly_Summary",
+      "monthly_table": "Burroughs_Recyclers_Monthly_Summary"
     },
     "smart_safes": {
       "stat_table": "Burroughs_Smart_Safes_Stat",
       "history_table": "Burroughs_Smart_Safes_Closed_Call_History",
       "hourly_table": "Burroughs_Smart_Safes_Hourly_Stat",
-      "daily_table": "Burroughs_Smart_Safes_Daily_Summary"
+      "daily_table": "Burroughs_Smart_Safes_Daily_Summary",
+      "weekly_table": "Burroughs_Smart_Safes_Weekly_Summary",
+      "monthly_table": "Burroughs_Smart_Safes_Monthly_Summary"
     }
   },
   "aggregation": {
@@ -38,6 +42,15 @@
     "daily": {
       "enabled": true,
       "aggregate_from": "hourly"
+    },
+    "weekly": {
+      "enabled": true,
+      "aggregate_from": "daily",
+      "week_starts_on": "Sunday"
+    },
+    "monthly": {
+      "enabled": true,
+      "aggregate_from": "weekly"
     }
   },
   "tracking_database": {
@@ -56,6 +69,14 @@
   "ups_api": {
     "client_id": "your-ups-client-id",
     "client_secret": "your-ups-client-secret"
+  },
+  "troubleshoot": {
+    "_comment": "Troubleshoot mode: When enabled, will reprocess the last processed batch on startup for testing/debugging",
+    "reprocess_last_batch_on_startup": false
+  },
+  "tracking": {
+    "_comment": "Tracking batch processing configuration",
+    "max_workers": 10
   }
 }
 

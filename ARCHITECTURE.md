@@ -153,7 +153,7 @@ burroughs_stat_tracker/
 3. **Process tracking** (`TrackingService`)
    - For each record, queries tracking database using Vendor Call Number
    - Extracts tracking number and parts
-   - Checks if tracking number matches in DesNote/PartNote/parts_tracking
+   - Checks if tracking number matches in DesNote or PartNote
    - If FedEx/UPS tracking number detected, queries carrier API for status
    - Updates `querytrackingnumber`, `queryparts`, `trackingmatch`, `tracking_status` columns
 

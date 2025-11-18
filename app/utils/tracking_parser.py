@@ -12,13 +12,47 @@ def _split_csv(value: Optional[str]) -> List[str]:
     return [item.strip() for item in str(value).split(',')]
 
 
+def extract_tracking_numbers_from_value(value: str) -> List[str]:
+    """
+    Extract all tracking numbers from a value that may contain dash-separated numbers.
+    Examples:
+      "414152235843" -> ["414152235843"]
+      "414152235843-414152235854" -> ["414152235843", "414152235854"]
+      "NP" -> []
+      "AT" -> []
+    """
+    if not value:
+        return []
+    
+    # Remove whitespace
+    value = value.strip()
+    
+    # Check if it's a status code (NP, AT, etc.)
+    if value.upper() in ['NP', 'AT', 'NOBIN']:
+        return []
+    
+    # Check if it contains a dash (multiple tracking numbers)
+    if '-' in value:
+        # Split by dash and filter for numeric values
+        parts = [part.strip() for part in value.split('-')]
+        tracking_numbers = [part for part in parts if part.isdigit()]
+        return tracking_numbers
+    
+    # Single tracking number (if numeric)
+    if value.isdigit():
+        return [value]
+    
+    return []
+
+
 def determine_tracking_number(row: Dict[str, str]) -> str:
     """
     Determine the latest tracking number based on query output fields.
 
     Rules:
       1. If AllPackNumbers ends with a non-zero number and the corresponding
-         AllTrackingStatuses value is numeric, return that number.
+         AllTrackingStatuses value contains tracking numbers (may be dash-separated),
+         return the first tracking number.
       2. If AllPackNumbers ends with a non-zero number but the corresponding
          tracking status ends with 'NP', tracking is not available yet.
       3. If the last AllPackNumbers value is 0 and AllBins does not end with
@@ -36,8 +70,11 @@ def determine_tracking_number(row: Dict[str, str]) -> str:
 
     # Rule 1 & 2: Last pack non-zero
     if last_pack and last_pack != '0':
-        if last_status and last_status.isdigit():
-            return last_status
+        # Extract tracking numbers from last_status (may be dash-separated)
+        tracking_numbers = extract_tracking_numbers_from_value(last_status)
+        if tracking_numbers:
+            # Return the first tracking number
+            return tracking_numbers[0]
         if last_status and last_status.upper().endswith('NP'):
             return 'not available yet'
 

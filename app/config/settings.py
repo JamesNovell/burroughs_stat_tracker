@@ -38,10 +38,14 @@ try:
     RECYCLERS_HISTORY_TABLE = CONFIG["tables"]["recyclers"].get("history_table", "Burroughs_Recyclers_Closed_Call_History")
     RECYCLERS_HOURLY_TABLE = CONFIG["tables"]["recyclers"].get("hourly_table", "Burroughs_Recyclers_Hourly_Stat")
     RECYCLERS_DAILY_TABLE = CONFIG["tables"]["recyclers"].get("daily_table", "Burroughs_Recyclers_Daily_Summary")
+    RECYCLERS_WEEKLY_TABLE = CONFIG["tables"]["recyclers"].get("weekly_table", "Burroughs_Recyclers_Weekly_Summary")
+    RECYCLERS_MONTHLY_TABLE = CONFIG["tables"]["recyclers"].get("monthly_table", "Burroughs_Recyclers_Monthly_Summary")
     SMART_SAFES_STAT_TABLE = CONFIG["tables"]["smart_safes"].get("stat_table", "Burroughs_Smart_Safes_Stat")
     SMART_SAFES_HISTORY_TABLE = CONFIG["tables"]["smart_safes"].get("history_table", "Burroughs_Smart_Safes_Closed_Call_History")
     SMART_SAFES_HOURLY_TABLE = CONFIG["tables"]["smart_safes"].get("hourly_table", "Burroughs_Smart_Safes_Hourly_Stat")
     SMART_SAFES_DAILY_TABLE = CONFIG["tables"]["smart_safes"].get("daily_table", "Burroughs_Smart_Safes_Daily_Summary")
+    SMART_SAFES_WEEKLY_TABLE = CONFIG["tables"]["smart_safes"].get("weekly_table", "Burroughs_Smart_Safes_Weekly_Summary")
+    SMART_SAFES_MONTHLY_TABLE = CONFIG["tables"]["smart_safes"].get("monthly_table", "Burroughs_Smart_Safes_Monthly_Summary")
     
     # Polling configuration
     POLL_INTERVAL_MINUTES = CONFIG.get("polling", {}).get("interval_minutes", 5)
@@ -66,6 +70,11 @@ try:
     HOURLY_VALIDATION_ENABLED = AGGREGATION_CONFIG.get("hourly", {}).get("validation_enabled", True)
     DAILY_AGGREGATION_ENABLED = AGGREGATION_CONFIG.get("daily", {}).get("enabled", True)
     DAILY_AGGREGATE_FROM = AGGREGATION_CONFIG.get("daily", {}).get("aggregate_from", "hourly")
+    WEEKLY_AGGREGATION_ENABLED = AGGREGATION_CONFIG.get("weekly", {}).get("enabled", True)
+    WEEKLY_AGGREGATE_FROM = AGGREGATION_CONFIG.get("weekly", {}).get("aggregate_from", "daily")
+    WEEK_STARTS_ON = AGGREGATION_CONFIG.get("weekly", {}).get("week_starts_on", "Sunday")
+    MONTHLY_AGGREGATION_ENABLED = AGGREGATION_CONFIG.get("monthly", {}).get("enabled", True)
+    MONTHLY_AGGREGATE_FROM = AGGREGATION_CONFIG.get("monthly", {}).get("aggregate_from", "weekly")
     
     # FedEx API configuration
     FEDEX_API_CONFIG = CONFIG.get("fedex_api", {})
@@ -77,8 +86,17 @@ try:
     UPS_API_CONFIG = CONFIG.get("ups_api", {})
     UPS_CLIENT_ID = UPS_API_CONFIG.get("client_id", "")
     UPS_CLIENT_SECRET = UPS_API_CONFIG.get("client_secret", "")
+    
+    # Troubleshoot configuration
+    TROUBLESHOOT_CONFIG = CONFIG.get("troubleshoot", {})
+    REPROCESS_LAST_BATCH_ON_STARTUP = TROUBLESHOOT_CONFIG.get("reprocess_last_batch_on_startup", False)
+    
+    # Tracking batch configuration
+    TRACKING_CONFIG = CONFIG.get("tracking", {})
+    TRACKING_MAX_WORKERS = TRACKING_CONFIG.get("max_workers", 10)
 except (FileNotFoundError, ValueError, KeyError) as e:
-    print(f"Configuration error: {e}")
-    print("Please ensure config.json exists and contains all required fields.")
+    import sys
+    sys.stderr.write(f"Configuration error: {e}\n")
+    sys.stderr.write("Please ensure config.json exists and contains all required fields.\n")
     raise
 

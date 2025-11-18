@@ -22,9 +22,10 @@ def is_fedex_tracking_number(tracking_number: str) -> bool:
     Check if a tracking number appears to be a FedEx tracking number.
     
     FedEx tracking numbers can be:
-    - 12 digits (Ground)
-    - 15 digits (Express)
-    - Alphanumeric (some formats)
+    - 12 digits
+    - 15 digits
+    - 20 digits
+    - 20 digits starting with 96
     
     Args:
         tracking_number: The tracking number to check
@@ -38,21 +39,9 @@ def is_fedex_tracking_number(tracking_number: str) -> bool:
     # Remove any whitespace
     tracking_number = tracking_number.strip()
     
-    # Check for 12 or 15 digit numbers (common FedEx formats)
-    if re.match(r'^\d{12}$', tracking_number) or re.match(r'^\d{15}$', tracking_number):
-        return True
-    
-    # Check for alphanumeric patterns (some FedEx formats)
-    # FedEx Express tracking numbers often start with specific patterns
-    if re.match(r'^[0-9]{4}[0-9]{4}[0-9]{4}$', tracking_number.replace('-', '').replace(' ', '')):
-        return True
-    
-    # Additional patterns for FedEx tracking numbers
-    # Some formats include letters
-    if re.match(r'^[0-9A-Z]{12,15}$', tracking_number.replace('-', '').replace(' ', '')):
-        return True
-    
-    return False
+    # FedEx pattern: 12, 15, 20 digits, or 20 digits starting with 96
+    fedex_pattern = r'\b(?:\d{12}|\d{15}|\d{20}|96\d{20})\b'
+    return bool(re.match(fedex_pattern, tracking_number))
 
 
 def get_access_token() -> Optional[str]:

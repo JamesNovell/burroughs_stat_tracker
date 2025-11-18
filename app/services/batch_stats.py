@@ -1,27 +1,47 @@
-"""Batch-level statistics processing and calculation."""
+"""
+Batch-level statistics processing and calculation.
+
+This module processes individual batches of service call data and calculates:
+- Current open call statistics (counts, averages, status breakdown)
+- Closed call statistics (same-day closures, first-time fixes, appointment averages)
+- Reopen rate (calls reopened within 14 days)
+- Repeat Dispatch Rate (RDR) - tracks follow-up appointments
+- Logs results to both stat table (for aggregation) and history table (for closed calls)
+"""
 import json
+import logging
 from collections import Counter
 from datetime import timedelta
 from app.utils.equipment import filter_by_equipment_type
 from app.utils.timezone import get_cst_date, to_cst
 
+logger = logging.getLogger(__name__)
+
 
 def process_equipment_type_stats(cursor, latest_calls, previous_calls, latest_pushed_at, latest_batch_id, 
                                   stat_table, history_table, equipment_type_name, is_recycler_type):
     """Process and save statistics for a specific equipment type."""
+    logger.info(f"[{equipment_type_name}] Processing batch {latest_batch_id} (pushed at {latest_pushed_at})")
+    
     # Filter calls by equipment type
+    logger.debug(f"[{equipment_type_name}] Filtering calls by equipment type (is_recycler={is_recycler_type})")
     latest_filtered = filter_by_equipment_type(latest_calls, is_recycler_type)
     previous_filtered = filter_by_equipment_type(previous_calls, is_recycler_type) if previous_calls else {}
+    logger.debug(f"[{equipment_type_name}] Filtered calls: latest={len(latest_filtered)}, previous={len(previous_filtered)}")
     
     # A. Current Open Call Stats
+    logger.debug(f"[{equipment_type_name}] Calculating current open call stats")
     total_open_calls = len(latest_filtered)
     status_counts = Counter(rec['Appt. Status'] for rec in latest_filtered.values())
     calls_with_multi_appt = sum(1 for rec in latest_filtered.values() if int(rec['Appointment']) >= 2)
     total_appointments = sum(int(rec['Appointment']) for rec in latest_filtered.values())
     avg_appt_num = total_appointments / total_open_calls if total_open_calls > 0 else 0
+    logger.debug(f"[{equipment_type_name}] Open calls: total={total_open_calls}, multi_appt={calls_with_multi_appt}, avg_appt={avg_appt_num:.2f}")
 
     # B. Closed Call & Rate Stats
+    logger.debug(f"[{equipment_type_name}] Calculating closed call stats")
     closed_call_ids = set(previous_filtered.keys()) - set(latest_filtered.keys()) if previous_filtered else set()
+    logger.debug(f"[{equipment_type_name}] Closed calls detected: {len(closed_call_ids)}")
     same_day_closures = 0
     first_time_fixes = 0
     completed_call_appointment_numbers = []
@@ -49,19 +69,24 @@ def process_equipment_type_stats(cursor, latest_calls, previous_calls, latest_pu
         equipment_id = prev_rec.get('Equipment_ID', None)
         vendor_call_number = prev_rec.get('Vendor Call Number', None)
         cursor.execute(merge_sql, (call_id, latest_pushed_at, prev_rec['Open DateTime'], equipment_id, vendor_call_number))
+        logger.debug(f"[{equipment_type_name}] Logged closed call {call_id} to history table")
 
     # Calculate rates
     total_closed = len(closed_call_ids)
     same_day_close_rate = same_day_closures / total_closed if total_closed > 0 else 0
     first_time_fix_rate = first_time_fixes / total_closed if total_closed > 0 else 0
     avg_appt_per_completed = sum(completed_call_appointment_numbers) / total_closed if total_closed > 0 else 0
+    logger.debug(f"[{equipment_type_name}] Closed call rates: same_day={same_day_close_rate:.2%}, first_time_fix={first_time_fix_rate:.2%}, avg_appt={avg_appt_per_completed:.2f}")
 
     # C. Reopen Rate
+    logger.debug(f"[{equipment_type_name}] Calculating reopen rate")
     newly_opened_call_ids = set(latest_filtered.keys()) - set(previous_filtered.keys()) if previous_filtered else set(latest_filtered.keys())
+    logger.debug(f"[{equipment_type_name}] Newly opened calls: {len(newly_opened_call_ids)}")
     reopened_calls = 0
     # Calculate 14 days ago in CST
     latest_pushed_at_cst = to_cst(latest_pushed_at)
     fourteen_days_ago = (latest_pushed_at_cst - timedelta(days=14)).replace(tzinfo=None)  # Remove timezone for SQL query
+    logger.debug(f"[{equipment_type_name}] Checking for reopened calls closed after {fourteen_days_ago}")
 
     if newly_opened_call_ids:
         # Use a single query to check all new calls against history
@@ -77,10 +102,13 @@ def process_equipment_type_stats(cursor, latest_calls, previous_calls, latest_pu
         # Must fetch all results before using rowcount or use len() on fetchall()
         reopened_results = cursor.fetchall()
         reopened_calls = len(reopened_results)
+        logger.debug(f"[{equipment_type_name}] Reopened calls found: {reopened_calls}/{len(newly_opened_call_ids)}")
 
     reopen_rate = reopened_calls / len(newly_opened_call_ids) if newly_opened_call_ids else 0
+    logger.debug(f"[{equipment_type_name}] Reopen rate: {reopen_rate:.2%}")
 
     # D. Repeat Dispatch Rate (RDR)
+    logger.debug(f"[{equipment_type_name}] Calculating Repeat Dispatch Rate (RDR)")
     # Follow-up appointments: Each time a call progresses to a new appointment number > 1
     total_follow_up_appointments = 0
     if previous_filtered:
@@ -91,15 +119,20 @@ def process_equipment_type_stats(cursor, latest_calls, previous_calls, latest_pu
                 # Count if appointment increased AND latest appointment is > 1
                 if latest_appt > previous_appt and latest_appt > 1:
                     total_follow_up_appointments += 1
+                    logger.debug(f"[{equipment_type_name}] Follow-up detected: call {call_id} progressed from appt {previous_appt} to {latest_appt}")
+    else:
+        logger.debug(f"[{equipment_type_name}] No previous batch for RDR calculation")
     
     # Total appointments: Count of unique appointment numbers in this batch
     unique_appointments = set()
     for call_id, record in latest_filtered.items():
         unique_appointments.add(int(record['Appointment']))
     total_appointments = len(unique_appointments)
+    logger.debug(f"[{equipment_type_name}] Unique appointments: {total_appointments}, Follow-up appointments: {total_follow_up_appointments}")
     
     # Calculate RDR
     repeat_dispatch_rate = total_follow_up_appointments / total_appointments if total_appointments > 0 else 0
+    logger.debug(f"[{equipment_type_name}] RDR: {repeat_dispatch_rate:.2%}")
 
     # Log Stats to Database
     stats_to_insert = {
@@ -117,44 +150,24 @@ def process_equipment_type_stats(cursor, latest_calls, previous_calls, latest_pu
     insert_cols = ", ".join(stats_to_insert.keys())
     insert_vals = ", ".join(["%s"] * len(stats_to_insert))
     insert_sql = f"INSERT INTO {stat_table} ({insert_cols}) VALUES ({insert_vals});"
-    cursor.execute(insert_sql, list(stats_to_insert.values()))
+    logger.debug(f"[{equipment_type_name}] Inserting stats into {stat_table}")
+    cursor.execute(insert_sql, tuple(stats_to_insert.values()))
+    logger.info(f"[{equipment_type_name}] Successfully logged batch {latest_batch_id} stats to {stat_table}")
 
-    # Print to Console
-    print(f"\n--- {equipment_type_name} Stats for Batch {latest_batch_id} ({latest_pushed_at}) ---")
-    print(f"Successfully logged to {stat_table} table.")
+    # Print to Console (for backward compatibility and human readability)
+    logger.info(f"[{equipment_type_name}] Stats for Batch {latest_batch_id} ({latest_pushed_at})")
     
+    # Log detailed stats
     if not previous_filtered:
-        print(f"\n[Note: This is the first {equipment_type_name} batch processed. No comparison data available.]")
+        logger.info(f"[{equipment_type_name}] Note: This is the first batch processed. No comparison data available.")
     
-    print(f"\n[ {equipment_type_name} - Current Open Calls ]")
-    print(f"Total Open Calls: {total_open_calls}")
-    print(f"Average Appointment Number: {avg_appt_num:.2f}")
-    print(f"Calls with 2+ Appointments: {calls_with_multi_appt}")
-    print("Status Breakdown:", json.dumps(status_counts))
+    logger.info(f"[{equipment_type_name}] Current Open Calls: {total_open_calls}, Avg Appt: {avg_appt_num:.2f}, Multi-Appt: {calls_with_multi_appt}")
+    logger.debug(f"[{equipment_type_name}] Status breakdown: {json.dumps(status_counts)}")
 
-    print(f"\n[ {equipment_type_name} - Closed Call KPIs ]")
     if previous_filtered:
-        print(f"Calls Closed Since Last Batch: {total_closed}")
-        print(f"Same-Day Close Rate: {same_day_close_rate:.2%}")
-        print(f"First-Time Fix Rate: {first_time_fix_rate:.2%}")
-        print(f"Average Appointments per Completed Call: {avg_appt_per_completed:.2f}")
+        logger.info(f"[{equipment_type_name}] Closed: {total_closed}, Same-Day Rate: {same_day_close_rate:.2%}, First-Time Fix: {first_time_fix_rate:.2%}, Avg Appt/Completed: {avg_appt_per_completed:.2f}")
+        logger.info(f"[{equipment_type_name}] New: {len(newly_opened_call_ids)}, Reopen Rate: {reopen_rate:.2%}")
+        logger.info(f"[{equipment_type_name}] RDR: Follow-ups={total_follow_up_appointments}, Unique Appts={total_appointments}, Rate={repeat_dispatch_rate:.2%}")
     else:
-        print("(No previous batch to compare - metrics will be available after next update)")
-
-    print(f"\n[ {equipment_type_name} - New & Reopened Call KPIs ]")
-    if previous_filtered:
-        print(f"Newly Opened Calls: {len(newly_opened_call_ids)}")
-        print(f"14-Day Reopen Rate: {reopen_rate:.2%}")
-    else:
-        print(f"Total Calls in Batch: {len(newly_opened_call_ids)}")
-        print("(Reopen rate will be calculated after next update)")
-    
-    print(f"\n[ {equipment_type_name} - Repeat Dispatch Rate (RDR) ]")
-    if previous_filtered:
-        print(f"Follow-up Appointments: {total_follow_up_appointments}")
-        print(f"Total Unique Appointments: {total_appointments}")
-        print(f"Repeat Dispatch Rate: {repeat_dispatch_rate:.2%}")
-    else:
-        print(f"Total Unique Appointments: {total_appointments}")
-        print("(RDR will be calculated after next update)")
+        logger.info(f"[{equipment_type_name}] Total in batch: {len(newly_opened_call_ids)}, Unique appointments: {total_appointments}")
 

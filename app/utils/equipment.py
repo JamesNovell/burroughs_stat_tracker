@@ -1,4 +1,10 @@
-"""Equipment type detection and filtering utilities."""
+"""
+Equipment type detection and filtering utilities.
+
+Equipment types are determined by Equipment_ID prefix:
+- Recyclers: N4R, N9R, N7F, RF
+- Smart Safes: All other prefixes
+"""
 
 
 def is_recycler(equipment_id):

@@ -1,10 +1,12 @@
-version: '3.8'
-
 services:
   burroughs-stat-tracker:
     build: 
       context: .
       dockerfile: Dockerfile
+    # Force amd64 platform for Microsoft ODBC Driver compatibility
+    # Microsoft ODBC Driver only supports amd64/x86_64 architecture
+    # Remove this line if building natively on amd64/x86_64
+    platform: linux/amd64
     container_name: burroughs-stat-tracker
     restart: unless-stopped
     volumes:
@@ -16,13 +18,24 @@ services:
       # Python unbuffered output for better logging
       - PYTHONUNBUFFERED=1
     # Health check to monitor the service
-    # Simple check that Python is working and can access the app directory
+    # Checks if the application can import and initialize (better than just file existence)
     healthcheck:
-      test: ["CMD", "python", "-c", "import os; os.path.exists('/app/main.py')"]
+      test: ["CMD", "python", "-c", "import sys; sys.path.insert(0, '/app'); from app.config import CONFIG; print('OK')"]
       interval: 5m
       timeout: 10s
       retries: 3
       start_period: 30s
+    # Resource limits to prevent resource exhaustion
+    # Note: deploy.resources works in Docker Swarm mode
+    # For standalone Docker, use: docker run --memory=1g --cpus=2.0 ...
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
     # Logging configuration
     logging:
       driver: "json-file"

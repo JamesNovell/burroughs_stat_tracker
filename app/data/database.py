@@ -1,5 +1,6 @@
 """Database connection and table creation management."""
 import pymssql
+import logging
 from app.config import (
     DB_HOST, DB_USER, DB_PASSWORD, DB_NAME,
     RECYCLERS_STAT_TABLE, RECYCLERS_HISTORY_TABLE, RECYCLERS_HOURLY_TABLE, RECYCLERS_DAILY_TABLE,
@@ -7,14 +8,18 @@ from app.config import (
     SOURCE_TABLE
 )
 
+logger = logging.getLogger(__name__)
+
 
 def get_db_connection():
     """Create and return a database connection."""
     if not all([DB_HOST, DB_USER, DB_PASSWORD]):
         raise ValueError("Database credentials must be set in config.json.")
     
+    logger.debug(f"Connecting to database: {DB_NAME} at {DB_HOST}")
     conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
     conn.autocommit(True)
+    logger.debug("Database connection established successfully")
     return conn
 
 
@@ -47,43 +52,9 @@ def create_stat_table(cursor, table_name):
         );
         """
         cursor.execute(stat_table_schema)
-        print(f"Created table: {table_name}")
+        logger.info(f"Created table: {table_name}")
     else:
-        print(f"Table already exists: {table_name}")
-        # Migration: Add RDR columns if they don't exist
-        try:
-            # Check if TotalFollowUpAppointments column exists
-            check_follow_up = f"""
-            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalFollowUpAppointments')
-            BEGIN
-                ALTER TABLE {table_name} ADD TotalFollowUpAppointments INT DEFAULT 0;
-                PRINT 'Added TotalFollowUpAppointments column to {table_name}';
-            END
-            """
-            cursor.execute(check_follow_up)
-            
-            # Check if TotalAppointments column exists
-            check_total_appt = f"""
-            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalAppointments')
-            BEGIN
-                ALTER TABLE {table_name} ADD TotalAppointments INT DEFAULT 0;
-                PRINT 'Added TotalAppointments column to {table_name}';
-            END
-            """
-            cursor.execute(check_total_appt)
-            
-            # Check if RepeatDispatchRate column exists
-            check_rdr = f"""
-            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'RepeatDispatchRate')
-            BEGIN
-                ALTER TABLE {table_name} ADD RepeatDispatchRate FLOAT;
-                PRINT 'Added RepeatDispatchRate column to {table_name}';
-            END
-            """
-            cursor.execute(check_rdr)
-        except Exception as e:
-            # Ignore errors if columns already exist
-            pass
+        logger.debug(f"Table already exists: {table_name}")
         # Migration: Add RDR columns if they don't exist
         try:
             # Check if TotalFollowUpAppointments column exists
@@ -139,9 +110,9 @@ def create_history_table(cursor, table_name):
         );
         """
         cursor.execute(history_table_schema)
-        print(f"Created table: {table_name}")
+        logger.info(f"Created table: {table_name}")
     else:
-        print(f"Table already exists: {table_name}")
+        logger.debug(f"Table already exists: {table_name}")
         # Migration: Add RDR columns if they don't exist
         try:
             # Check if TotalFollowUpAppointments column exists
@@ -219,6 +190,7 @@ def create_hourly_stat_table(cursor, table_name):
             HourlyStatID INT IDENTITY(1,1) PRIMARY KEY,
             Date DATE NOT NULL,
             Hour INT NOT NULL,
+            PeriodMinute INT NOT NULL DEFAULT 0,
             PeriodStart DATETIME NOT NULL,
             PeriodEnd DATETIME NOT NULL,
             Timestamp DATETIME NOT NULL,
@@ -230,6 +202,7 @@ def create_hourly_stat_table(cursor, table_name):
             TotalCallsWithMultiAppt INT DEFAULT 0,
             TotalNewCalls INT DEFAULT 0,
             TotalReopenedCalls INT DEFAULT 0,
+            TotalNotServicedYet INT DEFAULT 0,
             
             -- Sums (for averaging)
             SumAppointments INT DEFAULT 0,
@@ -240,7 +213,11 @@ def create_hourly_stat_table(cursor, table_name):
             SameDayCloseRate FLOAT,
             FirstTimeFixRate FLOAT,
             AvgAppointmentsPerCompletedCall FLOAT,
-            FourteenDayReopenRate FLOAT,
+            
+            -- First-Time Fix Rate running totals (accumulated throughout the day)
+            TotalFirstTimeFixes INT DEFAULT 0,
+            TotalClosedCallsForFTF INT DEFAULT 0,
+            FirstTimeFixRate_RunningTotal FLOAT,
             
             -- RDR metrics
             TotalFollowUpAppointments INT DEFAULT 0,
@@ -249,30 +226,51 @@ def create_hourly_stat_table(cursor, table_name):
             
             -- Metadata
             BatchCount INT DEFAULT 0,
+            BatchMissing BIT DEFAULT 0,
             CreatedAt DATETIME DEFAULT GETDATE(),
             
-            -- Unique constraint on date/hour combination
-            CONSTRAINT UQ_{safe_name}_Date_Hour UNIQUE (Date, Hour)
+            -- Unique constraint on date/hour/period combination
+            CONSTRAINT UQ_{safe_name}_Date_Hour_Period UNIQUE (Date, Hour, PeriodMinute)
         );
         """
         cursor.execute(hourly_table_schema)
         
         # Create indexes separately
         try:
-            index1_sql = f"CREATE INDEX IX_{safe_name}_Date_Hour ON {table_name}(Date, Hour);"
+            index1_sql = f"CREATE INDEX IX_{safe_name}_Date_Hour_Period ON {table_name}(Date, Hour, PeriodMinute);"
             cursor.execute(index1_sql)
             
             index2_sql = f"CREATE INDEX IX_{safe_name}_Period ON {table_name}(PeriodStart, PeriodEnd);"
             cursor.execute(index2_sql)
         except Exception as e:
             # Indexes might already exist, ignore error
-            pass
+            logger.debug(f"Index creation skipped (may already exist): {e}")
         
-        print(f"Created table: {table_name}")
+        logger.info(f"Created table: {table_name}")
     else:
-        print(f"Table already exists: {table_name}")
-        # Migration: Add RDR columns if they don't exist
+        logger.debug(f"Table already exists: {table_name}")
+        # Migration: Add/remove columns if they don't exist
         try:
+            # Check if PeriodMinute column exists
+            check_period_minute = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'PeriodMinute')
+            BEGIN
+                ALTER TABLE {table_name} ADD PeriodMinute INT NOT NULL DEFAULT 0;
+                PRINT 'Added PeriodMinute column to {table_name}';
+            END
+            """
+            cursor.execute(check_period_minute)
+            
+            # Check if BatchMissing column exists
+            check_batch_missing = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'BatchMissing')
+            BEGIN
+                ALTER TABLE {table_name} ADD BatchMissing BIT DEFAULT 0;
+                PRINT 'Added BatchMissing column to {table_name}';
+            END
+            """
+            cursor.execute(check_batch_missing)
+            
             # Check if TotalFollowUpAppointments column exists
             check_follow_up = f"""
             IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalFollowUpAppointments')
@@ -302,6 +300,54 @@ def create_hourly_stat_table(cursor, table_name):
             END
             """
             cursor.execute(check_rdr)
+            
+            # Check if TotalNotServicedYet column exists (calls with Appointment = 1)
+            check_not_serviced = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalNotServicedYet')
+            BEGIN
+                ALTER TABLE {table_name} ADD TotalNotServicedYet INT DEFAULT 0;
+                PRINT 'Added TotalNotServicedYet column to {table_name}';
+            END
+            """
+            cursor.execute(check_not_serviced)
+            
+            # Remove FourteenDayReopenRate if it exists
+            check_reopen = f"""
+            IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'FourteenDayReopenRate')
+            BEGIN
+                ALTER TABLE {table_name} DROP COLUMN FourteenDayReopenRate;
+                PRINT 'Removed FourteenDayReopenRate column from {table_name}';
+            END
+            """
+            cursor.execute(check_reopen)
+            
+            # Check if First-Time Fix Rate running total columns exist
+            check_ftf_total = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalFirstTimeFixes')
+            BEGIN
+                ALTER TABLE {table_name} ADD TotalFirstTimeFixes INT DEFAULT 0;
+                PRINT 'Added TotalFirstTimeFixes column to {table_name}';
+            END
+            """
+            cursor.execute(check_ftf_total)
+            
+            check_ftf_closed = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalClosedCallsForFTF')
+            BEGIN
+                ALTER TABLE {table_name} ADD TotalClosedCallsForFTF INT DEFAULT 0;
+                PRINT 'Added TotalClosedCallsForFTF column to {table_name}';
+            END
+            """
+            cursor.execute(check_ftf_closed)
+            
+            check_ftf_running = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'FirstTimeFixRate_RunningTotal')
+            BEGIN
+                ALTER TABLE {table_name} ADD FirstTimeFixRate_RunningTotal FLOAT;
+                PRINT 'Added FirstTimeFixRate_RunningTotal column to {table_name}';
+            END
+            """
+            cursor.execute(check_ftf_running)
         except Exception as e:
             # Ignore errors if columns already exist
             pass
@@ -324,15 +370,18 @@ def create_daily_summary_table(cursor, table_name):
             AvgApptNum_ClosedToday FLOAT,
             TotalOpenAtEndOfDay INT,
             TotalClosedEOD INT,
-            TotalActiveToday INT,
+            TotalSameDayClosures INT DEFAULT 0,
+            TotalCallsWithMultiAppt INT DEFAULT 0,
+            TotalNotServicedYet INT DEFAULT 0,
+            FirstTimeFixRate_RunningTotal FLOAT,
             RepeatDispatchRate FLOAT,
             CreatedAt DATETIME DEFAULT GETDATE()
         );
         """
         cursor.execute(daily_table_schema)
-        print(f"Created table: {table_name}")
+        logger.info(f"Created table: {table_name}")
     else:
-        print(f"Table already exists: {table_name}")
+        logger.debug(f"Table already exists: {table_name}")
         # Migration: Add RDR columns if they don't exist
         try:
             # Check if TotalFollowUpAppointments column exists
@@ -436,6 +485,56 @@ def create_daily_summary_table(cursor, table_name):
             END
             """
             cursor.execute(check_rdr)
+            
+            # Check if TotalSameDayClosures column exists
+            check_same_day = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalSameDayClosures')
+            BEGIN
+                ALTER TABLE {table_name} ADD TotalSameDayClosures INT DEFAULT 0;
+                PRINT 'Added TotalSameDayClosures column to {table_name}';
+            END
+            """
+            cursor.execute(check_same_day)
+            
+            # Check if TotalCallsWithMultiAppt column exists
+            check_multi_appt = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalCallsWithMultiAppt')
+            BEGIN
+                ALTER TABLE {table_name} ADD TotalCallsWithMultiAppt INT DEFAULT 0;
+                PRINT 'Added TotalCallsWithMultiAppt column to {table_name}';
+            END
+            """
+            cursor.execute(check_multi_appt)
+            
+            # Check if TotalNotServicedYet column exists
+            check_not_serviced = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalNotServicedYet')
+            BEGIN
+                ALTER TABLE {table_name} ADD TotalNotServicedYet INT DEFAULT 0;
+                PRINT 'Added TotalNotServicedYet column to {table_name}';
+            END
+            """
+            cursor.execute(check_not_serviced)
+            
+            # Remove TotalActiveToday if it exists
+            check_active = f"""
+            IF EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'TotalActiveToday')
+            BEGIN
+                ALTER TABLE {table_name} DROP COLUMN TotalActiveToday;
+                PRINT 'Removed TotalActiveToday column from {table_name}';
+            END
+            """
+            cursor.execute(check_active)
+            
+            # Check if FirstTimeFixRate_RunningTotal column exists
+            check_ftf_running = f"""
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('{table_name}') AND name = 'FirstTimeFixRate_RunningTotal')
+            BEGIN
+                ALTER TABLE {table_name} ADD FirstTimeFixRate_RunningTotal FLOAT;
+                PRINT 'Added FirstTimeFixRate_RunningTotal column to {table_name}';
+            END
+            """
+            cursor.execute(check_ftf_running)
         except Exception as e:
             # Ignore errors if columns don't exist or already renamed
             pass
@@ -461,6 +560,21 @@ def ensure_tracking_columns_exist(cursor):
             ALTER TABLE {SOURCE_TABLE} ADD queryparts NVARCHAR(MAX);
             PRINT 'Added queryparts column to {SOURCE_TABLE}';
         END
+        ELSE
+        BEGIN
+            -- Check if column is too small and alter it if needed
+            DECLARE @max_length INT;
+            SELECT @max_length = max_length 
+            FROM sys.columns 
+            WHERE object_id = OBJECT_ID('{SOURCE_TABLE}') AND name = 'queryparts';
+            
+            -- If column exists but is not MAX (which is -1), alter it to MAX
+            IF @max_length != -1
+            BEGIN
+                ALTER TABLE {SOURCE_TABLE} ALTER COLUMN queryparts NVARCHAR(MAX);
+                PRINT 'Altered queryparts column to NVARCHAR(MAX) in {SOURCE_TABLE}';
+            END
+        END
         """
         cursor.execute(check_parts)
         
@@ -485,29 +599,125 @@ def ensure_tracking_columns_exist(cursor):
         cursor.execute(check_status)
     except Exception as e:
         # Log error but don't fail - columns may already exist or table may not exist yet
-        print(f"Warning: Could not ensure tracking columns exist: {e}")
+        logger.warning(f"Could not ensure tracking columns exist: {e}")
+
+
+def create_weekly_summary_table(cursor, table_name):
+    """Create a weekly summary table if it doesn't exist."""
+    # Check if table exists
+    check_table = f"SELECT COUNT(*) as table_count FROM sys.tables WHERE name = '{table_name}';"
+    cursor.execute(check_table)
+    table_exists = cursor.fetchone()['table_count'] > 0
+    
+    if not table_exists:
+        weekly_table_schema = f"""
+        CREATE TABLE {table_name} (
+            WeeklyStatID INT IDENTITY(1,1) PRIMARY KEY,
+            WeekStartDate DATE NOT NULL,
+            WeekEndDate DATE NOT NULL,
+            Year INT NOT NULL,
+            WeekNumber INT NOT NULL,
+            Timestamp DATETIME NOT NULL,
+            
+            -- Aggregated metrics from daily summaries
+            AvgApptNum_OpenAtEndOfWeek FLOAT,
+            AvgApptNum_ClosedThisWeek FLOAT,
+            TotalOpenAtEndOfWeek INT DEFAULT 0,
+            TotalClosedThisWeek INT DEFAULT 0,
+            TotalSameDayClosures INT DEFAULT 0,
+            TotalCallsWithMultiAppt INT DEFAULT 0,
+            TotalNotServicedYet INT DEFAULT 0,
+            FirstTimeFixRate_RunningTotal FLOAT,
+            RepeatDispatchRate FLOAT,
+            
+            -- Metadata
+            DayCount INT DEFAULT 0,
+            CreatedAt DATETIME DEFAULT GETDATE(),
+            
+            -- Unique constraint on week
+            CONSTRAINT UQ_{table_name.replace('.', '_').replace(' ', '_')}_Week UNIQUE (Year, WeekNumber)
+        );
+        """
+        cursor.execute(weekly_table_schema)
+        logger.info(f"Created table: {table_name}")
+    else:
+        logger.debug(f"Table already exists: {table_name}")
+
+
+def create_monthly_summary_table(cursor, table_name):
+    """Create a monthly summary table if it doesn't exist."""
+    # Check if table exists
+    check_table = f"SELECT COUNT(*) as table_count FROM sys.tables WHERE name = '{table_name}';"
+    cursor.execute(check_table)
+    table_exists = cursor.fetchone()['table_count'] > 0
+    
+    if not table_exists:
+        monthly_table_schema = f"""
+        CREATE TABLE {table_name} (
+            MonthlyStatID INT IDENTITY(1,1) PRIMARY KEY,
+            Year INT NOT NULL,
+            Month INT NOT NULL,
+            MonthStartDate DATE NOT NULL,
+            MonthEndDate DATE NOT NULL,
+            Timestamp DATETIME NOT NULL,
+            
+            -- Aggregated metrics from weekly summaries
+            AvgApptNum_OpenAtEndOfMonth FLOAT,
+            AvgApptNum_ClosedThisMonth FLOAT,
+            TotalOpenAtEndOfMonth INT DEFAULT 0,
+            TotalClosedThisMonth INT DEFAULT 0,
+            TotalSameDayClosures INT DEFAULT 0,
+            TotalCallsWithMultiAppt INT DEFAULT 0,
+            TotalNotServicedYet INT DEFAULT 0,
+            FirstTimeFixRate_RunningTotal FLOAT,
+            RepeatDispatchRate FLOAT,
+            
+            -- Metadata
+            WeekCount INT DEFAULT 0,
+            CreatedAt DATETIME DEFAULT GETDATE(),
+            
+            -- Unique constraint on year/month
+            CONSTRAINT UQ_{table_name.replace('.', '_').replace(' ', '_')}_Month UNIQUE (Year, Month)
+        );
+        """
+        cursor.execute(monthly_table_schema)
+        logger.info(f"Created table: {table_name}")
+    else:
+        logger.debug(f"Table already exists: {table_name}")
 
 
 def create_tables_if_not_exist(cursor):
     """Ensures the necessary statistics and history tables exist for both equipment types."""
-    print("\n=== Checking and creating tables ===")
+    from app.config import (
+        RECYCLERS_WEEKLY_TABLE, RECYCLERS_MONTHLY_TABLE,
+        SMART_SAFES_WEEKLY_TABLE, SMART_SAFES_MONTHLY_TABLE
+    )
+    
+    logger.info("=" * 80)
+    logger.info("Checking and creating tables")
+    logger.info("=" * 80)
+    
     # Create tables for recyclers
-    print(f"\n[Recyclers Tables]")
+    logger.info("[Recyclers Tables]")
     create_stat_table(cursor, RECYCLERS_STAT_TABLE)
     create_history_table(cursor, RECYCLERS_HISTORY_TABLE)
     create_hourly_stat_table(cursor, RECYCLERS_HOURLY_TABLE)
     create_daily_summary_table(cursor, RECYCLERS_DAILY_TABLE)
+    create_weekly_summary_table(cursor, RECYCLERS_WEEKLY_TABLE)
+    create_monthly_summary_table(cursor, RECYCLERS_MONTHLY_TABLE)
     
     # Create tables for smart safes
-    print(f"\n[Smart Safes Tables]")
+    logger.info("[Smart Safes Tables]")
     create_stat_table(cursor, SMART_SAFES_STAT_TABLE)
     create_history_table(cursor, SMART_SAFES_HISTORY_TABLE)
     create_hourly_stat_table(cursor, SMART_SAFES_HOURLY_TABLE)
     create_daily_summary_table(cursor, SMART_SAFES_DAILY_TABLE)
+    create_weekly_summary_table(cursor, SMART_SAFES_WEEKLY_TABLE)
+    create_monthly_summary_table(cursor, SMART_SAFES_MONTHLY_TABLE)
     
     # Ensure tracking columns exist in source table
-    print(f"\n[Source Table - Tracking Columns]")
+    logger.info("[Source Table - Tracking Columns]")
     ensure_tracking_columns_exist(cursor)
     
-    print("=== Table check complete ===\n")
+    logger.info("Table check complete")
 

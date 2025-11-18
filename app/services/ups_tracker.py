@@ -19,11 +19,10 @@ def is_ups_tracking_number(tracking_number: str) -> bool:
     """
     Check if a tracking number appears to be a UPS tracking number.
     
-    UPS tracking numbers are typically:
-    - 18 characters, alphanumeric
-    - Start with "1Z" followed by 6 alphanumeric characters
-    - Then 2 digits, then 8 alphanumeric characters
-    - Format: 1Z[6 alphanumeric][2 digits][8 alphanumeric]
+    UPS tracking numbers are:
+    - 18 characters total
+    - Start with "1Z" followed by 16 alphanumeric characters
+    - Format: 1Z[16 alphanumeric]
     
     Args:
         tracking_number: The tracking number to check
@@ -37,22 +36,9 @@ def is_ups_tracking_number(tracking_number: str) -> bool:
     # Remove any whitespace and convert to uppercase
     tracking_number = tracking_number.strip().upper().replace(' ', '').replace('-', '')
     
-    # UPS tracking numbers are 18 characters and start with 1Z
-    if len(tracking_number) == 18 and tracking_number.startswith('1Z'):
-        # Pattern: 1Z followed by 6 alphanumeric, 2 digits, 8 alphanumeric
-        if re.match(r'^1Z[0-9A-Z]{6}[0-9]{2}[0-9A-Z]{8}$', tracking_number):
-            return True
-    
-    # Also check for 9-digit UPS tracking numbers (ground)
-    if len(tracking_number) == 9 and tracking_number.isdigit():
-        return True
-    
-    # Check for other UPS formats (some variations exist)
-    # Some UPS numbers are 11 digits
-    if len(tracking_number) == 11 and tracking_number.isdigit():
-        return True
-    
-    return False
+    # UPS pattern: 1Z followed by exactly 16 alphanumeric characters
+    ups_pattern = r'\b1Z[0-9A-Z]{16}\b'
+    return bool(re.match(ups_pattern, tracking_number))
 
 
 def get_access_token() -> Optional[str]:

@@ -1,85 +1,111 @@
-"""Daily summary calculation and storage."""
-from datetime import datetime, timedelta
+"""
+Daily summary calculation and storage.
+
+This module calculates daily summaries from either batch aggregations or raw batch data.
+Calculates metrics for the last 24 hours from the configured End-of-Day (EOD) time.
+Supports two aggregation methods:
+1. From batch aggregation stats (preferred, more efficient)
+2. From raw batch data (fallback, more comprehensive)
+
+Rolling daily metrics (TotalSameDayClosures, SameDayCloseRate, RepeatDispatchRate) are
+persisted at EOD using the latest batch aggregation's rolling values. These metrics reset at the next EOD.
+"""
+import logging
+from datetime import datetime, timedelta, time
 from app.config import SOURCE_TABLE, EOD_HOUR, EOD_MINUTE, DAILY_AGGREGATE_FROM, DAILY_AGGREGATION_ENABLED
 from app.utils.equipment import filter_by_equipment_type, is_recycler
 from app.utils.timezone import is_end_of_day_cst, get_cst_date, to_cst, CST
 from app.utils.data import deduplicate_records
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_daily_summary(cursor, latest_pushed_at, latest_calls, stat_table, history_table, hourly_table, daily_table, 
                             equipment_type_name, is_recycler_type):
     """Calculate and store daily summary at configured end of day time (default 11:59 PM CST).
     Calculates metrics for the last 24 hours from the EOD time.
-    Can aggregate from hourly stats (if configured) or from raw batch data."""
+    Can aggregate from batch aggregation stats (if configured) or from raw batch data."""
     # Check if it's end of day
     if not is_end_of_day_cst(latest_pushed_at):
+        logger.debug(f"[{equipment_type_name}] Not end of day ({latest_pushed_at}), skipping daily summary")
         return
     
     if not DAILY_AGGREGATION_ENABLED:
+        logger.debug(f"[{equipment_type_name}] Daily aggregation disabled, skipping")
         return
+    
+    logger.info(f"[{equipment_type_name}] Calculating daily summary (EOD detected at {latest_pushed_at})")
     
     # Route to appropriate aggregation method
     if DAILY_AGGREGATE_FROM == "hourly" and hourly_table:
+        logger.debug(f"[{equipment_type_name}] Using batch aggregation method")
         calculate_daily_summary_from_hourly(cursor, latest_pushed_at, hourly_table, daily_table, equipment_type_name)
     else:
+        logger.debug(f"[{equipment_type_name}] Using raw batch data aggregation method")
         calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, stat_table, history_table, daily_table,
                                         equipment_type_name, is_recycler_type)
 
 
 def calculate_daily_summary_from_hourly(cursor, latest_pushed_at, hourly_table, daily_table, equipment_type_name):
-    """Calculate daily summary by aggregating from hourly statistics."""
+    """Calculate daily summary by aggregating from batch aggregation statistics."""
     # Get the EOD time in CST for the current date
     current_date_cst = get_cst_date(latest_pushed_at)
     latest_pushed_at_cst = to_cst(latest_pushed_at)
     
     # Calculate the EOD datetime for this date
-    eod_datetime_cst = CST.localize(datetime.combine(current_date_cst, datetime.time(EOD_HOUR, EOD_MINUTE)))
+    eod_datetime_cst = CST.localize(datetime.combine(current_date_cst, time(EOD_HOUR, EOD_MINUTE)))
     
     # Calculate 24 hours before EOD
     start_time_cst = eod_datetime_cst - timedelta(hours=24)
     
-    print(f"\n=== Calculating Daily Summary for {equipment_type_name} - {current_date_cst} (from hourly stats) ===")
-    print(f"Aggregating hours from: {start_time_cst.strftime('%Y-%m-%d %H:%M:%S %Z')} to {eod_datetime_cst.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(f"[{equipment_type_name}] Calculating daily summary from batch aggregation stats for {current_date_cst}")
+    logger.debug(f"[{equipment_type_name}] Aggregating batches from: {start_time_cst.strftime('%Y-%m-%d %H:%M:%S %Z')} to {eod_datetime_cst.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     
-    # Get all hourly stats within the 24-hour window
+    # Get all batch aggregation stats within the 24-hour window
     hourly_stats_query = f"""
     SELECT 
-        Date, Hour, PeriodStart, PeriodEnd,
+        Date, Hour, PeriodMinute, PeriodStart, PeriodEnd,
         TotalOpenCalls,
         TotalClosedCalls,
         TotalSameDayClosures,
         TotalCallsWithMultiAppt,
+        TotalNotServicedYet,
         SumAppointments,
         SumCompletedAppointments,
         AverageAppointmentNumber,
         SameDayCloseRate,
         FirstTimeFixRate,
         AvgAppointmentsPerCompletedCall,
-        FourteenDayReopenRate,
+        FirstTimeFixRate_RunningTotal,
         TotalFollowUpAppointments,
         TotalAppointments,
-        RepeatDispatchRate
+        RepeatDispatchRate,
+        BatchMissing
     FROM {hourly_table}
     WHERE PeriodStart >= %s AND PeriodEnd <= %s
-    ORDER BY Date, Hour ASC;
+    ORDER BY Date, Hour, PeriodMinute ASC;
     """
+    logger.debug(f"[{equipment_type_name}] Querying batch aggregation stats from {hourly_table}")
     cursor.execute(hourly_stats_query, (start_time_cst.replace(tzinfo=None), eod_datetime_cst.replace(tzinfo=None)))
     hourly_stats = cursor.fetchall()
+    logger.debug(f"[{equipment_type_name}] Retrieved {len(hourly_stats)} batch aggregation stat records")
     
     if not hourly_stats:
-        print(f"No hourly stats found for {current_date_cst}")
+        logger.warning(f"[{equipment_type_name}] No batch aggregation stats found for {current_date_cst}")
         return
     
-    # Aggregate hourly stats
+    # Aggregate batch aggregation stats
     # For open calls at EOD, use the latest hour's TotalOpenCalls
     # For closed calls, sum all TotalClosedCalls
-    # For appointments, sum all SumAppointments and SumCompletedAppointments
+    # For appointments, use latest hour's AverageAppointmentNumber for open calls
+    # For closed appointments, sum all SumCompletedAppointments
     
     total_open_at_eod = 0
     total_closed_eod = 0
     total_same_day_closures = 0
     total_calls_with_multi_appt = 0
-    sum_appointments_open = 0
+    total_not_serviced_yet = 0
+    avg_appt_num_open_eod = 0  # Will use latest hour's AverageAppointmentNumber
     sum_appointments_closed = 0
     
     # Weighted rates
@@ -91,36 +117,43 @@ def calculate_daily_summary_from_hourly(cursor, latest_pushed_at, hourly_table, 
     # RDR aggregation
     total_follow_up_appointments = 0
     
+    # First-Time Fix Rate running total (use the latest hour's running total)
+    first_time_fix_rate_running_total = 0
+    
     latest_hour_stat = None
     
     for hour_stat in hourly_stats:
-        # Use latest hour's open calls count
-        total_open_at_eod = hour_stat['TotalOpenCalls'] or 0
-        
-        # Sum closed calls
+        # Sum closed calls across all periods (for calculating avg appointment number for closed calls)
         total_closed_eod += hour_stat['TotalClosedCalls'] or 0
-        total_same_day_closures += hour_stat['TotalSameDayClosures'] or 0
-        total_calls_with_multi_appt = hour_stat['TotalCallsWithMultiAppt'] or 0  # Use latest
         
-        # Sum appointments
-        sum_appointments_open += hour_stat['SumAppointments'] or 0
+        # Sum completed appointments (for closed calls average)
         sum_appointments_closed += hour_stat['SumCompletedAppointments'] or 0
         
-        # Weighted rates
+        # For rates: use period's rates (rolling daily metrics)
+        # Note: SameDayCloseRate and RepeatDispatchRate are now rolling daily metrics
+        # FirstTimeFixRate and AvgAppointmentsPerCompletedCall are still period-only
         closed_count = hour_stat['TotalClosedCalls'] or 0
         if closed_count > 0:
             total_closed_for_rates += closed_count
-            weighted_same_day_rate += (hour_stat['SameDayCloseRate'] or 0) * closed_count
             weighted_first_time_rate += (hour_stat['FirstTimeFixRate'] or 0) * closed_count
             weighted_avg_appt_rate += (hour_stat['AvgAppointmentsPerCompletedCall'] or 0) * closed_count
         
-        # Sum follow-up appointments from all hours
-        total_follow_up_appointments += hour_stat['TotalFollowUpAppointments'] or 0
+        # Use latest period's values (overwritten each iteration, ends with last period)
+        # These are rolling daily metrics, so use the latest period's value
+        total_open_at_eod = hour_stat['TotalOpenCalls'] or 0
+        avg_appt_num_open_eod = hour_stat['AverageAppointmentNumber'] or 0
+        total_same_day_closures = hour_stat['TotalSameDayClosures'] or 0
+        total_calls_with_multi_appt = hour_stat['TotalCallsWithMultiAppt'] or 0
+        total_not_serviced_yet = hour_stat['TotalNotServicedYet'] or 0
+        same_day_close_rate = hour_stat['SameDayCloseRate'] or 0
+        repeat_dispatch_rate = hour_stat['RepeatDispatchRate'] or 0
+        first_time_fix_rate_running_total = hour_stat['FirstTimeFixRate_RunningTotal'] or 0
         
         latest_hour_stat = hour_stat
     
     # For unique appointments across the 24-hour window, query source table
     # Get all batches in the 24-hour window
+    logger.debug(f"[{equipment_type_name}] Querying batches in 24-hour window for unique appointments")
     batches_query = f"""
     SELECT DISTINCT \"Pushed At\"
     FROM {SOURCE_TABLE}
@@ -129,11 +162,12 @@ def calculate_daily_summary_from_hourly(cursor, latest_pushed_at, hourly_table, 
     """
     cursor.execute(batches_query, (start_time_cst.replace(tzinfo=None), eod_datetime_cst.replace(tzinfo=None)))
     batches_in_window = cursor.fetchall()
+    logger.debug(f"[{equipment_type_name}] Found {len(batches_in_window)} batches in 24-hour window")
     
-    # Determine equipment type from hourly_table name
+    # Determine equipment type from batch aggregation table name
     from app.config import RECYCLERS_HOURLY_TABLE
-    from app.utils.equipment import is_recycler
     is_recycler_type = (hourly_table == RECYCLERS_HOURLY_TABLE)
+    logger.debug(f"[{equipment_type_name}] Equipment type detection: is_recycler={is_recycler_type}")
     
     # Collect unique appointment numbers from all batches in the 24-hour window
     unique_appointments_daily = set()
@@ -147,6 +181,7 @@ def calculate_daily_summary_from_hourly(cursor, latest_pushed_at, hourly_table, 
         """
         cursor.execute(appointments_query, tuple(batch_timestamps))
         appointment_records = cursor.fetchall()
+        logger.debug(f"[{equipment_type_name}] Retrieved {len(appointment_records)} appointment records from source table")
         
         # Filter by equipment type and collect unique appointments
         for record in appointment_records:
@@ -154,40 +189,44 @@ def calculate_daily_summary_from_hourly(cursor, latest_pushed_at, hourly_table, 
             if is_recycler(equipment_id) == is_recycler_type:
                 unique_appointments_daily.add(int(record['Appointment']))
     
-    total_appointments_daily = len(unique_appointments_daily)
-    
-    # Calculate daily RDR
-    daily_rdr = total_follow_up_appointments / total_appointments_daily if total_appointments_daily > 0 else 0
-    
     # Calculate averages
-    avg_appt_open_eod = sum_appointments_open / total_open_at_eod if total_open_at_eod > 0 else 0
+    # For open calls at EOD, use the latest hour's AverageAppointmentNumber (already calculated)
+    avg_appt_open_eod = avg_appt_num_open_eod
+    # For closed calls, calculate average from sum
     avg_appt_closed_today = sum_appointments_closed / total_closed_eod if total_closed_eod > 0 else 0
     
-    # Calculate weighted rates
-    same_day_close_rate = weighted_same_day_rate / total_closed_for_rates if total_closed_for_rates > 0 else 0
+    # Use latest batch aggregation's rolling rates (already calculated in batch aggregator)
+    # same_day_close_rate and repeat_dispatch_rate are already set from latest batch aggregation
+    # Calculate weighted rates for FirstTimeFixRate and AvgAppointmentsPerCompletedCall (batch-only metrics)
     first_time_fix_rate = weighted_first_time_rate / total_closed_for_rates if total_closed_for_rates > 0 else 0
     avg_appt_per_completed = weighted_avg_appt_rate / total_closed_for_rates if total_closed_for_rates > 0 else 0
     
-    # Total active today = open at EOD + closed today
-    total_active_today = total_open_at_eod + total_closed_eod
+    # Note: same_day_close_rate and repeat_dispatch_rate are rolling daily metrics from latest hour
+    # They are already set from the latest hour_stat in the loop above
     
     # Insert daily summary
     insert_daily_sql = f"""
     INSERT INTO {daily_table} (Date, Timestamp, AvgApptNum_OpenAtEndOfDay, AvgApptNum_ClosedToday, 
-                               TotalOpenAtEndOfDay, TotalClosedEOD, TotalActiveToday, RepeatDispatchRate)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                               TotalOpenAtEndOfDay, TotalClosedEOD, TotalSameDayClosures, 
+                               TotalCallsWithMultiAppt, TotalNotServicedYet, FirstTimeFixRate_RunningTotal, RepeatDispatchRate)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
     """
     cursor.execute(insert_daily_sql, (
         current_date_cst, latest_pushed_at_cst.replace(tzinfo=None), avg_appt_open_eod, avg_appt_closed_today,
-        total_open_at_eod, total_closed_eod, total_active_today, daily_rdr
+        total_open_at_eod, total_closed_eod, total_same_day_closures, 
+        total_calls_with_multi_appt, total_not_serviced_yet, first_time_fix_rate_running_total, repeat_dispatch_rate
     ))
     
-    print(f"Daily Summary for {equipment_type_name} - {current_date_cst} (from {len(hourly_stats)} hourly stats):")
-    print(f"  Open at EOD: {total_open_at_eod} calls, Avg Appointment: {avg_appt_open_eod:.2f}")
-    print(f"  Closed in last 24h: {total_closed_eod} calls, Avg Appointment: {avg_appt_closed_today:.2f}")
-    print(f"  Total Active (last 24h): {total_active_today} calls")
-    print(f"  RDR: {total_follow_up_appointments} follow-ups / {total_appointments_daily} unique appointments = {daily_rdr:.2%}")
-    print(f"Successfully saved to {daily_table}")
+    logger.info(f"[{equipment_type_name}] Daily summary for {current_date_cst} (from {len(hourly_stats)} batch aggregations):")
+    logger.info(f"[{equipment_type_name}]   Open at EOD: {total_open_at_eod} calls, Avg Appt: {avg_appt_open_eod:.2f}")
+    logger.info(f"[{equipment_type_name}]   Closed in last 24h: {total_closed_eod} calls, Avg Appt: {avg_appt_closed_today:.2f}")
+    logger.info(f"[{equipment_type_name}]   Same-day closures (rolling daily): {total_same_day_closures}")
+    logger.info(f"[{equipment_type_name}]   Same-day close rate (rolling daily): {same_day_close_rate:.2%}")
+    logger.info(f"[{equipment_type_name}]   Calls with multi-appt: {total_calls_with_multi_appt}")
+    logger.info(f"[{equipment_type_name}]   Not serviced yet: {total_not_serviced_yet}")
+    logger.info(f"[{equipment_type_name}]   First-Time Fix Rate (running total): {first_time_fix_rate_running_total:.2%}")
+    logger.info(f"[{equipment_type_name}]   Repeat Dispatch Rate (rolling daily): {repeat_dispatch_rate:.2%}")
+    logger.info(f"[{equipment_type_name}] Successfully saved daily summary to {daily_table}")
 
 
 def calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, stat_table, history_table, daily_table, 
@@ -199,16 +238,17 @@ def calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, sta
     latest_pushed_at_cst = to_cst(latest_pushed_at)
     
     # Calculate the EOD datetime for this date
-    eod_datetime_cst = CST.localize(datetime.combine(current_date_cst, datetime.time(EOD_HOUR, EOD_MINUTE)))
+    eod_datetime_cst = CST.localize(datetime.combine(current_date_cst, time(EOD_HOUR, EOD_MINUTE)))
     
     # Calculate 24 hours before EOD
     start_time_cst = eod_datetime_cst - timedelta(hours=24)
     
-    print(f"\n=== Calculating Daily Summary for {equipment_type_name} - {current_date_cst} ===")
-    print(f"Calculating for last 24 hours: {start_time_cst.strftime('%Y-%m-%d %H:%M:%S %Z')} to {eod_datetime_cst.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    logger.info(f"[{equipment_type_name}] Calculating daily summary from raw batch data for {current_date_cst}")
+    logger.debug(f"[{equipment_type_name}] Calculating for last 24 hours: {start_time_cst.strftime('%Y-%m-%d %H:%M:%S %Z')} to {eod_datetime_cst.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     
     # Filter calls by equipment type
     latest_filtered = filter_by_equipment_type(latest_calls, is_recycler_type)
+    logger.debug(f"[{equipment_type_name}] Filtered {len(latest_filtered)} calls for this equipment type")
     
     # Get all batches from the last 24 hours (from start_time to EOD)
     batches_today_query = f"""
@@ -217,15 +257,17 @@ def calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, sta
     WHERE \"Pushed At\" >= %s AND \"Pushed At\" <= %s
     ORDER BY \"Pushed At\" ASC;
     """
+    logger.debug(f"[{equipment_type_name}] Querying batches in 24-hour window")
     cursor.execute(batches_today_query, (start_time_cst.replace(tzinfo=None), eod_datetime_cst.replace(tzinfo=None)))
     batches_today = cursor.fetchall()
+    logger.debug(f"[{equipment_type_name}] Found {len(batches_today)} batches in 24-hour window")
     
     if not batches_today:
-        print(f"No batches found for {current_date_cst}")
+        logger.warning(f"[{equipment_type_name}] No batches found for {current_date_cst}")
         return
     
     # Get all unique calls that appeared in any batch today
-    cols_to_fetch = '"ID", "Service_Call_ID", "Appt. Status", "Appointment", "Open DateTime", "Batch ID", "Pushed At", "Equipment_ID", "Vendor Call Number", "DesNote", "PartNote", "parts_tracking"'
+    cols_to_fetch = '"ID", "Service_Call_ID", "Appt. Status", "Appointment", "Open DateTime", "Batch ID", "Pushed At", "Equipment_ID", "Vendor Call Number", "DesNote", "PartNote"'
     all_calls_today = {}
     
     for batch in batches_today:
@@ -317,7 +359,7 @@ def calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, sta
             # Still open - use latest appointment number
             open_calls_at_eod[call_id] = int(record['Appointment'])
     
-    # Bug 3 Fix: Process closed calls that don't appear in any batch within the 24-hour window
+    # Process closed calls that don't appear in any batch within the 24-hour window
     # These are calls that were opened before the window and closed within it
     closed_calls_not_in_batches = closed_call_ids_today - set(all_calls_today.keys())
     
@@ -351,7 +393,25 @@ def calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, sta
     # Calculate averages
     total_open_at_eod = len(open_calls_at_eod)
     total_closed_eod = len(closed_calls_today)
-    total_active_today = len(all_calls_today)
+    
+    # Calculate TotalSameDayClosures from closed calls
+    total_same_day_closures = 0
+    current_date_cst_for_comparison = get_cst_date(latest_pushed_at)
+    for closed_rec in closed_history:
+        open_datetime_cst = to_cst(closed_rec['OpenDateTime'])
+        if open_datetime_cst.date() == current_date_cst_for_comparison:
+            total_same_day_closures += 1
+    
+    # Calculate TotalCallsWithMultiAppt from open calls at EOD
+    total_calls_with_multi_appt = sum(1 for appt in open_calls_at_eod.values() if appt >= 2)
+    
+    # Calculate TotalNotServicedYet (calls with Appointment = 1) from open calls at EOD
+    total_not_serviced_yet = sum(1 for appt in open_calls_at_eod.values() if appt == 1)
+    
+    # Calculate First-Time Fix Rate running total for the day
+    # Count first-time fixes (closed calls with Appointment = 1) from closed calls today
+    total_first_time_fixes = sum(1 for appt in closed_calls_today if appt == 1)
+    first_time_fix_rate_running_total = total_first_time_fixes / total_closed_eod if total_closed_eod > 0 else 0
     
     avg_appt_open_eod = sum(open_calls_at_eod.values()) / total_open_at_eod if total_open_at_eod > 0 else 0
     avg_appt_closed_today = sum(closed_calls_today) / total_closed_eod if total_closed_eod > 0 else 0
@@ -359,17 +419,22 @@ def calculate_daily_summary_from_raw(cursor, latest_pushed_at, latest_calls, sta
     # Insert new daily summary row for this batch
     insert_daily_sql = f"""
     INSERT INTO {daily_table} (Date, Timestamp, AvgApptNum_OpenAtEndOfDay, AvgApptNum_ClosedToday, 
-                               TotalOpenAtEndOfDay, TotalClosedEOD, TotalActiveToday)
-    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                               TotalOpenAtEndOfDay, TotalClosedEOD, TotalSameDayClosures, 
+                               TotalCallsWithMultiAppt, TotalNotServicedYet, FirstTimeFixRate_RunningTotal)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
     """
     cursor.execute(insert_daily_sql, (
         current_date_cst, latest_pushed_at_cst.replace(tzinfo=None), avg_appt_open_eod, avg_appt_closed_today,
-        total_open_at_eod, total_closed_eod, total_active_today
+        total_open_at_eod, total_closed_eod, total_same_day_closures, 
+        total_calls_with_multi_appt, total_not_serviced_yet, first_time_fix_rate_running_total
     ))
     
-    print(f"Daily Summary for {equipment_type_name} - {current_date_cst}:")
-    print(f"  Open at EOD: {total_open_at_eod} calls, Avg Appointment: {avg_appt_open_eod:.2f}")
-    print(f"  Closed in last 24h: {total_closed_eod} calls, Avg Appointment: {avg_appt_closed_today:.2f}")
-    print(f"  Total Active (last 24h): {total_active_today} calls")
-    print(f"Successfully saved to {daily_table}")
+    logger.info(f"[{equipment_type_name}] Daily summary for {current_date_cst}:")
+    logger.info(f"[{equipment_type_name}]   Open at EOD: {total_open_at_eod} calls, Avg Appt: {avg_appt_open_eod:.2f}")
+    logger.info(f"[{equipment_type_name}]   Closed in last 24h: {total_closed_eod} calls, Avg Appt: {avg_appt_closed_today:.2f}")
+    logger.info(f"[{equipment_type_name}]   Same-day closures: {total_same_day_closures}")
+    logger.info(f"[{equipment_type_name}]   Calls with multi-appt: {total_calls_with_multi_appt}")
+    logger.info(f"[{equipment_type_name}]   Not serviced yet: {total_not_serviced_yet}")
+    logger.info(f"[{equipment_type_name}]   First-Time Fix Rate (running total): {first_time_fix_rate_running_total:.2%}")
+    logger.info(f"[{equipment_type_name}] Successfully saved daily summary to {daily_table}")
 

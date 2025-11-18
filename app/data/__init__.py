@@ -6,6 +6,8 @@ from app.data.database import (
     create_history_table,
     create_hourly_stat_table,
     create_daily_summary_table,
+    create_weekly_summary_table,
+    create_monthly_summary_table,
     ensure_tracking_columns_exist,
 )
 
@@ -16,6 +18,8 @@ __all__ = [
     'create_history_table',
     'create_hourly_stat_table',
     'create_daily_summary_table',
+    'create_weekly_summary_table',
+    'create_monthly_summary_table',
     'ensure_tracking_columns_exist',
 ]
 
